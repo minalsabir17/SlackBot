@@ -2,7 +2,6 @@ import os
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler  
 
-# Initialize app with PROPER token format
 app = App(token="SLACK_TOKEN")  
 
 @app.message("hello")
