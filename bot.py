@@ -163,11 +163,20 @@ Focus on the key political points, candidates mentioned, and main issues discuss
 **Top Comments:**
 {comments_text}
 
-Please provide:
-1. **Post Summary** (2-3 sentences): Key points from the original post
-2. **Community Response** (2-3 sentences): What people are saying in the comments - common themes, reactions, additional insights, or disagreements"""
+Please provide a well-structured response with the following sections:
+
+**📋 Post Summary**
+2-3 sentences covering the key political points, candidates mentioned, and main issues discussed.
+
+**💬 Community Response** 
+2-3 sentences about what people are saying in the comments - common themes, reactions, additional insights, disagreements, or concerns raised by residents."""
         else:
-            prompt += "\n\nProvide a 2-3 sentence summary of the key political points."
+            prompt += """
+
+Please provide:
+
+**📋 Post Summary**
+2-3 sentences covering the key political points, candidates mentioned, and main issues discussed."""
 
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -215,6 +224,75 @@ def fetch_reddit_comments(reddit_id, subreddit_name, max_comments=10):
     except Exception as e:
         print(f"[Comment Fetch] Error fetching comments for {reddit_id}: {e}")
         return []
+
+
+def format_ai_overview_markdown(ai_overview, comment_count):
+    """
+    Format the AI overview with proper Slack markdown formatting using blocks.
+    Returns a list of Slack blocks for better visual presentation.
+    """
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "🤖 *AI Overview & Community Analysis*"
+            }
+        },
+        {"type": "divider"}
+    ]
+    
+    # Split the overview into sections if it contains structured content
+    sections = ai_overview.split('\n\n')
+    
+    for section in sections:
+        if section.strip():
+            # Clean up the section text
+            section_text = section.strip()
+            
+            # Format headers (lines starting with **) 
+            if section_text.startswith('**') and section_text.count('**') >= 2:
+                # This is a header section
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": section_text
+                    }
+                })
+            else:
+                # Regular content section
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn", 
+                        "text": section_text
+                    }
+                })
+    
+    # Add footer with comment count
+    if comment_count > 0:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"📊 _Analyzed {comment_count} community comments_"
+                }
+            ]
+        })
+    else:
+        blocks.append({
+            "type": "context", 
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "📄 _Post-only analysis (no comments available)_"
+                }
+            ]
+        })
+        
+    return blocks
 
 
 def reddit_item_producer():
@@ -397,11 +475,14 @@ def handle_reaction_added(client: WebClient, event: dict):
                     )
                     
                     if ai_overview:
-                        # Post AI overview as a thread reply
+                        # Format AI overview with markdown
+                        formatted_overview = format_ai_overview_markdown(ai_overview, len(comments))
+                        
+                        # Post AI overview as a thread reply using blocks for better formatting
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=timestamp,
-                            text=f"🤖 *AI Overview:*\n{ai_overview}"
+                            blocks=formatted_overview
                         )
                         print(f"[Reaction Handler] Posted AI overview for {reddit_post_data['title']} with {len(comments)} comments")
                     else:
