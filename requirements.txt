@@ -3,3 +3,6 @@ praw
 python-dotenv
 pandas
 numpy
+openai
+slack-sdk
+certifi

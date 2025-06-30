@@ -6,18 +6,70 @@ import json
 import praw
 from dotenv import dotenv_values
 from queue import Queue
+from openai import OpenAI
+from slack_sdk import WebClient
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.request import SocketModeRequest
+from slack_sdk.socket_mode.response import SocketModeResponse
 
 # --- CONFIGURATION ---
 # Load environment variables from a .env file for security
 try:
     config = dotenv_values(".env")
     SLACK_WEBHOOK_URL = config['SLACK_WEBHOOK_URL']
+    SLACK_BOT_TOKEN = config.get('SLACK_BOT_TOKEN')  # For reading reactions
+    SLACK_APP_TOKEN = config.get('SLACK_APP_TOKEN')  # For socket mode
     REDDIT_CLIENT_ID = config['REDDIT_CLIENT_ID']
     REDDIT_CLIENT_SECRET = config['REDDIT_CLIENT_SECRET']
     REDDIT_USER_AGENT = config.get('REDDIT_USER_AGENT', 'Reddit Scraper 1.0')
+    OPENAI_API_KEY = config.get('OPENAI_API_KEY')
 except KeyError as e:
     print(f"Error: Missing environment variable {e}. Please check your .env file.")
     exit(1)
+
+# Initialize OpenAI client (optional for AI overviews)
+openai_client = None
+if OPENAI_API_KEY:
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("OpenAI client initialized for AI overviews.")
+    except Exception as e:
+        print(f"Warning: Could not initialize OpenAI client: {e}")
+        print("AI overviews will be disabled.")
+else:
+    print("No OpenAI API key found. AI overviews will be disabled.")
+
+# Initialize Slack clients for reaction handling
+slack_web_client = None
+slack_socket_client = None
+
+print(f"[DEBUG] SLACK_BOT_TOKEN exists: {bool(SLACK_BOT_TOKEN)}")
+print(f"[DEBUG] SLACK_APP_TOKEN exists: {bool(SLACK_APP_TOKEN)}")
+
+if SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
+    try:
+        import ssl
+        import certifi
+        
+        # Create SSL context for Slack connections
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        print("[DEBUG] Creating Slack WebClient...")
+        slack_web_client = WebClient(token=SLACK_BOT_TOKEN, ssl=ssl_context)
+        
+        print("[DEBUG] Creating Slack SocketModeClient...")
+        slack_socket_client = SocketModeClient(
+            app_token=SLACK_APP_TOKEN,
+            web_client=slack_web_client
+        )
+        print("Slack interactive clients initialized for reaction handling.")
+    except Exception as e:
+        print(f"Warning: Could not initialize Slack clients: {e}")
+        print("Reaction-based AI overviews will be disabled.")
+        slack_web_client = None
+        slack_socket_client = None
+else:
+    print("Slack bot/app tokens not found. Reaction-based AI overviews will be disabled.")
 
 # --- CONSTANTS ---
 # The subreddit and keywords you want to monitor
@@ -49,14 +101,6 @@ KEYWORDS_TO_MONITOR = [
     "Hudson County Board of Commissioners", "Jersey City BOE",
     "JC Redevelopment Agency", "NJ ELEC", "machine politics", "county line",
 
-    # High-salience local issues & policy terms
-    "rent control", "rent stabilization", "property-tax revaluation", "Reval",
-    "affordable housing", "Inclusionary Zoning", "IZO", "Liberty State Park",
-    "Caven Point", "PATH extension", "Jersey City–Newark PATH", "Vision Zero",
-    "bike lanes", "short-term rentals", "Airbnb ordinance", "public safety",
-    "police funding", "gun violence", "cannabis dispensary",
-    "flooding", "stormwater fee", "Resiliency Plan", "Jersey City Greenway",
-    "school funding", "state aid cuts",
 
     # Election mechanics & GOTV terms
     "vote by mail", "VBM", "early voting", "sample ballot", "polling place",
@@ -66,7 +110,8 @@ KEYWORDS_TO_MONITOR = [
 # How often to check for new items (in seconds)
 FETCH_INTERVAL = 60
 # How many recent posts to scan
-SUBMISSION_LIMIT = 25 
+SUBMISSION_LIMIT = 25
+
 
 # --- GLOBAL SHARED RESOURCES ---
 # A thread-safe queue to hold items (posts or comments) waiting to be sent to Slack
@@ -76,6 +121,8 @@ seen_submission_ids = set()
 seen_comment_ids = set()
 # An event to signal threads to stop running gracefully
 stop_event = threading.Event()
+# Dictionary to store message metadata for reaction handling
+message_metadata = {}
 
 # --- REDDIT API SETUP ---
 try:
@@ -88,6 +135,41 @@ try:
 except Exception as e:
     print(f"Failed to authenticate with Reddit: {e}")
     exit(1)
+
+
+def generate_ai_overview(text, title=""):
+    """
+    Generate an AI overview/summary of the given text using OpenAI.
+    Returns the summary or None if AI is not available.
+    """
+    if not openai_client:
+        return None
+    
+    try:
+        # Prepare the prompt
+        prompt = f"""Please provide a concise summary (2-3 sentences) of this Reddit post about Jersey City politics:
+
+Title: {title}
+
+Content: {text}
+
+Focus on the key political points, candidates mentioned, and main issues discussed."""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes local political content."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150,
+            temperature=0.3
+        )
+        
+        return response.choices[0].message.content.strip()
+    
+    except Exception as e:
+        print(f"[AI Overview] Error generating summary: {e}")
+        return None
 
 
 def reddit_item_producer():
@@ -153,7 +235,7 @@ def slack_item_consumer():
                             "type": "section",
                             "text": {
                                 "type": "mrkdwn",
-                                "text": f"*<{data.permalink}|{data.title}>*\n{data.selftext[:500]}{'...' if len(data.selftext) > 500 else ''}"
+                                "text": f"*<https://reddit.com{data.permalink}|{data.title}>*\n{data.selftext[:500]}{'...' if len(data.selftext) > 500 else ''}"
                             }
                         }
                     ]
@@ -176,7 +258,7 @@ def slack_item_consumer():
                         {
                             "type": "context",
                             "elements": [
-                                { "type": "mrkdwn", "text": f"In post: *<{data.submission.permalink}|{data.submission.title}>*" }
+                                { "type": "mrkdwn", "text": f"In post: *<https://reddit.com{data.submission.permalink}|{data.submission.title}>*" }
                             ]
                         }
                     ]
@@ -190,6 +272,18 @@ def slack_item_consumer():
                 )
                 if response.status_code == 200:
                     print(f"[Consumer] Successfully posted {item_type} {data.id} to Slack.")
+                    
+                    # Store metadata for reaction handling (only for submissions)
+                    if item_type == 'submission' and slack_web_client:
+                        # Note: We can't get the message timestamp from webhook response
+                        # Store basic info for potential reaction handling
+                        message_metadata[data.id] = {
+                            'type': 'submission',
+                            'title': data.title,
+                            'selftext': data.selftext,
+                            'permalink': data.permalink,
+                            'author': str(data.author)
+                        }
                 else:
                     print(f"[Consumer] Failed to post message: {response.status_code}, {response.text}")
             
@@ -198,16 +292,148 @@ def slack_item_consumer():
         except Exception:
             pass # Queue was empty, continue loop
 
+def handle_reaction_added(client: WebClient, event: dict):
+    """
+    Handle reaction_added events to trigger AI overviews when robot emoji is used.
+    """
+    try:
+        print(f"[Reaction Handler] Received reaction event: {event.get('reaction')} by user {event.get('user')}")
+        
+        # Check if it's a robot emoji reaction
+        if event.get("reaction") == "robot_face":
+            channel = event.get("item", {}).get("channel")
+            timestamp = event.get("item", {}).get("ts")
+            
+            if not channel or not timestamp:
+                return
+            
+            # Get the message content to extract Reddit post ID
+            try:
+                message_result = client.conversations_history(
+                    channel=channel,
+                    latest=timestamp,
+                    limit=1,
+                    inclusive=True
+                )
+                
+                if not message_result["ok"] or not message_result["messages"]:
+                    return
+                
+                message = message_result["messages"][0]
+                message_text = ""
+                
+                # Extract text from blocks
+                for block in message.get("blocks", []):
+                    if block.get("type") == "section" and "text" in block:
+                        message_text += block["text"].get("text", "")
+                
+                # Try to find Reddit post ID or permalink in the message
+                reddit_post_data = None
+                for post_id, metadata in message_metadata.items():
+                    if metadata["title"] in message_text or metadata["permalink"] in message_text:
+                        reddit_post_data = metadata
+                        break
+                
+                if reddit_post_data and openai_client:
+                    # Generate AI overview
+                    ai_overview = generate_ai_overview(
+                        reddit_post_data["selftext"], 
+                        reddit_post_data["title"]
+                    )
+                    
+                    if ai_overview:
+                        # Post AI overview as a thread reply
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=timestamp,
+                            text=f"🤖 *AI Overview:*\n{ai_overview}"
+                        )
+                        print(f"[Reaction Handler] Posted AI overview for {reddit_post_data['title']}")
+                    else:
+                        print("[Reaction Handler] Failed to generate AI overview")
+                else:
+                    print("[Reaction Handler] Could not find matching Reddit post or OpenAI not available")
+                        
+            except Exception as e:
+                print(f"[Reaction Handler] Error processing message: {e}")
+                
+    except Exception as e:
+        print(f"[Reaction Handler] Error handling reaction: {e}")
+
+def slack_reaction_handler():
+    """
+    Handle Slack events including reactions using Socket Mode.
+    """
+    print(f"[Reaction Handler] Socket client status: {slack_socket_client}")
+    
+    if not slack_socket_client:
+        print("[Reaction Handler] Slack Socket Mode not available. Skipping reaction handling.")
+        return
+    
+    print("[Reaction Handler] Socket client is available, setting up event handler...")
+    
+    def process_events(client: SocketModeClient, req: SocketModeRequest):
+        print(f"[Reaction Handler] Received socket event: {req.type}")
+        
+        if req.type == "events_api":
+            # Acknowledge the request
+            response = SocketModeResponse(envelope_id=req.envelope_id)
+            client.send_socket_mode_response(response)
+            
+            # Handle the event
+            event = req.payload.get("event", {})
+            print(f"[Reaction Handler] Event type: {event.get('type')}")
+            
+            if event.get("type") == "reaction_added":
+                handle_reaction_added(slack_web_client, event)
+            else:
+                print(f"[Reaction Handler] Ignoring event type: {event.get('type')}")
+    
+    slack_socket_client.socket_mode_request_listeners.append(process_events)
+    
+    print("[Reaction Handler] Starting Slack event listener...")
+    try:
+        print("[Reaction Handler] Attempting to connect to Slack...")
+        slack_socket_client.connect()
+        print("[Reaction Handler] Successfully connected to Slack Socket Mode!")
+        
+        # Keep the connection alive with periodic status
+        connection_check_counter = 0
+        while not stop_event.is_set():
+            time.sleep(1)
+            connection_check_counter += 1
+            if connection_check_counter % 30 == 0:  # Every 30 seconds
+                print(f"[Reaction Handler] Connection alive, waiting for events... ({connection_check_counter}s)")
+    except Exception as e:
+        print(f"[Reaction Handler] Error in socket mode: {e}")
+        print("[Reaction Handler] Check your Slack app configuration and tokens.")
+    finally:
+        print("[Reaction Handler] Disconnecting from Slack...")
+        slack_socket_client.disconnect()
+
 def main():
     """Main function to start and manage the bot threads."""
     producer_thread = threading.Thread(target=reddit_item_producer)
     consumer_thread = threading.Thread(target=slack_item_consumer)
+    
+    # Start reaction handler if Slack interactive mode is available
+    reaction_thread = None
+    if slack_socket_client:
+        reaction_thread = threading.Thread(target=slack_reaction_handler)
 
     producer_thread.start()
     consumer_thread.start()
+    
+    if reaction_thread:
+        reaction_thread.start()
+        print("[Main] Started reaction handler thread.")
 
     try:
-        while producer_thread.is_alive() and consumer_thread.is_alive():
+        threads_to_monitor = [producer_thread, consumer_thread]
+        if reaction_thread:
+            threads_to_monitor.append(reaction_thread)
+            
+        while all(thread.is_alive() for thread in threads_to_monitor):
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[Main] Shutdown signal received. Stopping threads...")
@@ -215,6 +441,8 @@ def main():
 
     producer_thread.join()
     consumer_thread.join()
+    if reaction_thread:
+        reaction_thread.join()
     print("[Main] All threads have been stopped. Exiting.")
 
 if __name__ == "__main__":
