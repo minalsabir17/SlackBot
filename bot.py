@@ -137,31 +137,45 @@ except Exception as e:
     exit(1)
 
 
-def generate_ai_overview(text, title=""):
+def generate_ai_overview(text, title="", comments_data=None):
     """
-    Generate an AI overview/summary of the given text using OpenAI.
+    Generate an AI overview/summary of the given text and comments using OpenAI.
     Returns the summary or None if AI is not available.
     """
     if not openai_client:
         return None
     
     try:
-        # Prepare the prompt
-        prompt = f"""Please provide a concise summary (2-3 sentences) of this Reddit post about Jersey City politics:
+        # Prepare the base prompt
+        prompt = f"""Please provide a comprehensive summary of this Reddit post about Jersey City politics:
 
-Title: {title}
+**Title:** {title}
 
-Content: {text}
+**Post Content:** {text}
 
 Focus on the key political points, candidates mentioned, and main issues discussed."""
+
+        # Add comments analysis if available
+        if comments_data and len(comments_data) > 0:
+            comments_text = "\n".join([f"- {comment}" for comment in comments_data[:10]])  # Limit to top 10 comments
+            prompt += f"""
+
+**Top Comments:**
+{comments_text}
+
+Please provide:
+1. **Post Summary** (2-3 sentences): Key points from the original post
+2. **Community Response** (2-3 sentences): What people are saying in the comments - common themes, reactions, additional insights, or disagreements"""
+        else:
+            prompt += "\n\nProvide a 2-3 sentence summary of the key political points."
 
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes local political content."},
+                {"role": "system", "content": "You are a helpful assistant that summarizes local political content and community discussions."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=150,
+            max_tokens=300,  # Increased for comment analysis
             temperature=0.3
         )
         
@@ -170,6 +184,37 @@ Focus on the key political points, candidates mentioned, and main issues discuss
     except Exception as e:
         print(f"[AI Overview] Error generating summary: {e}")
         return None
+
+
+def fetch_reddit_comments(reddit_id, subreddit_name, max_comments=10):
+    """
+    Fetch comments from a Reddit post for analysis.
+    Returns a list of comment texts.
+    """
+    try:
+        # Get the submission from Reddit
+        submission = reddit.submission(id=reddit_id)
+        
+        # Fetch comments (replace "load more" with actual comments)
+        submission.comments.replace_more(limit=0)
+        
+        comments = []
+        for comment in submission.comments.list()[:max_comments]:
+            # Skip MoreComments objects and only process actual Comment objects
+            if (comment.__class__.__name__ == 'Comment' and
+                hasattr(comment, 'body') and 
+                hasattr(comment, 'author') and
+                comment.author is not None and  # Skip deleted accounts
+                str(comment.body).strip() not in ['[deleted]', '[removed]'] and
+                len(str(comment.body).strip()) > 20):  # Ignore very short comments
+                comments.append(str(comment.body).strip())
+        
+        print(f"[Comment Fetch] Found {len(comments)} comments for post {reddit_id}")
+        return comments
+        
+    except Exception as e:
+        print(f"[Comment Fetch] Error fetching comments for {reddit_id}: {e}")
+        return []
 
 
 def reddit_item_producer():
@@ -282,7 +327,9 @@ def slack_item_consumer():
                             'title': data.title,
                             'selftext': data.selftext,
                             'permalink': data.permalink,
-                            'author': str(data.author)
+                            'author': str(data.author),
+                            'reddit_id': data.id,  # Store Reddit post ID for comment fetching
+                            'subreddit': str(data.subreddit)
                         }
                 else:
                     print(f"[Consumer] Failed to post message: {response.status_code}, {response.text}")
@@ -335,10 +382,18 @@ def handle_reaction_added(client: WebClient, event: dict):
                         break
                 
                 if reddit_post_data and openai_client:
-                    # Generate AI overview
+                    # Fetch comments for analysis
+                    print(f"[Reaction Handler] Fetching comments for post {reddit_post_data['reddit_id']}...")
+                    comments = fetch_reddit_comments(
+                        reddit_post_data['reddit_id'], 
+                        reddit_post_data['subreddit']
+                    )
+                    
+                    # Generate AI overview with comments
                     ai_overview = generate_ai_overview(
                         reddit_post_data["selftext"], 
-                        reddit_post_data["title"]
+                        reddit_post_data["title"],
+                        comments_data=comments
                     )
                     
                     if ai_overview:
@@ -348,7 +403,7 @@ def handle_reaction_added(client: WebClient, event: dict):
                             thread_ts=timestamp,
                             text=f"🤖 *AI Overview:*\n{ai_overview}"
                         )
-                        print(f"[Reaction Handler] Posted AI overview for {reddit_post_data['title']}")
+                        print(f"[Reaction Handler] Posted AI overview for {reddit_post_data['title']} with {len(comments)} comments")
                     else:
                         print("[Reaction Handler] Failed to generate AI overview")
                 else:
