@@ -6,3 +6,9 @@ numpy
 openai
 slack-sdk
 certifi
+nltk
+spacy
+matplotlib
+seaborn
+wordcloud
+plotly
